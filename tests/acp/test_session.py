@@ -463,3 +463,47 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# _make_agent threads the resolved runtime wire into AIAgent (KSL-121)
+# ---------------------------------------------------------------------------
+
+class TestMakeAgentRuntimeWire:
+    """Pin the fresh-session selection point: session/new builds its agent via
+    SessionManager._make_agent, whose transport (api_mode/base_url/provider)
+    is exactly what hermes_cli.runtime_provider.resolve_runtime_provider
+    decides for the requested provider — no ACP-local re-routing in between."""
+
+    def test_make_agent_threads_resolved_wire_into_aiagent(self, monkeypatch, tmp_path):
+        recorded = {}
+
+        class _FakeAIAgent:
+            def __init__(self, **kwargs):
+                recorded.update(kwargs)
+                self._print_fn = None
+
+        runtime = {
+            "provider": "zai",
+            "api_mode": "chat_completions",
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+            "api_key": "glm-key",
+            "command": None,
+            "args": [],
+        }
+
+        import hermes_cli.config as config_mod
+        import hermes_cli.runtime_provider as rp_mod
+        import run_agent as run_agent_mod
+
+        monkeypatch.setattr(run_agent_mod, "AIAgent", _FakeAIAgent)
+        monkeypatch.setattr(config_mod, "load_config", lambda: {"model": {"provider": "zai", "default": "glm-5.3-flash"}})
+        monkeypatch.setattr(rp_mod, "resolve_runtime_provider", lambda **k: dict(runtime))
+
+        manager = SessionManager(agent_factory=None)
+        manager._make_agent(session_id="ses_wire", cwd=str(tmp_path))
+
+        assert recorded["provider"] == "zai"
+        assert recorded["api_mode"] == "chat_completions"
+        assert recorded["base_url"] == "https://open.bigmodel.cn/api/coding/paas/v4"
+        assert recorded["model"] == "glm-5.3-flash"

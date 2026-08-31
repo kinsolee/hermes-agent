@@ -1751,3 +1751,131 @@ class TestAzureFoundryResolution:
 
         assert resolved["api_mode"] == "codex_responses"
 
+
+
+# ---------------------------------------------------------------------------
+# Persisted model.api_mode vs the provider's declared wire (KSL-121)
+# ---------------------------------------------------------------------------
+
+class TestPersistedApiModeContradiction:
+    """A persisted api_mode that contradicts the provider's registry-declared
+    transport is stale endpoint-era state and must be dropped.
+
+    Fingerprint this guards: t7820 Hermes source home carried
+    ``model.provider=zai`` + a Coding Plan chat-completions base, while a stale
+    ``model.api_mode=codex_responses`` (left from an earlier openai-codex
+    default) re-activated because the provider NAMES now matched — every fresh
+    ACP agent task then POSTed ``{.../v4}/responses`` and 404'd, while
+    ``hermes chat --provider zai`` (config provider mismatch at the time)
+    ignored the stale mode and kept working.
+    """
+
+    CODING_BASE = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+    def _zai_env(self, monkeypatch, api_mode):
+        class _NoCredPool:
+            def has_credentials(self):
+                return False
+
+        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "zai")
+        monkeypatch.setattr(
+            rp,
+            "_get_model_config",
+            lambda: {
+                "provider": "zai",
+                "default": "glm-5.3-flash",
+                "api_mode": api_mode,
+            },
+        )
+        monkeypatch.setattr(
+            rp,
+            "resolve_api_key_provider_credentials",
+            lambda provider: {
+                "api_key": "glm-key",
+                "base_url": self.CODING_BASE,
+                "source": "env",
+            },
+        )
+        monkeypatch.setattr(rp, "load_pool", lambda provider: _NoCredPool())
+
+    def test_zai_drops_stale_persisted_codex_responses(self, monkeypatch):
+        """KSL-121 regression: stale codex_responses must not survive a zai
+        resolution — GLM's paas v4 endpoints have no /responses surface."""
+        self._zai_env(monkeypatch, "codex_responses")
+
+        resolved = rp.resolve_runtime_provider(requested="zai")
+
+        assert resolved["provider"] == "zai"
+        assert resolved["api_mode"] == "chat_completions"
+        assert resolved["base_url"] == self.CODING_BASE
+
+    def test_zai_keeps_persisted_mode_matching_declared_wire(self, monkeypatch):
+        self._zai_env(monkeypatch, "chat_completions")
+
+        resolved = rp.resolve_runtime_provider(requested="zai")
+
+        assert resolved["api_mode"] == "chat_completions"
+
+    def test_contradiction_predicate_semantics(self):
+        """Direct pins for the staleness predicate."""
+        from hermes_cli.runtime_provider import (
+            _persisted_api_mode_contradicts_provider as contradicts,
+        )
+
+
+        # Stale mode vs GLM Coding Plan chat-completions base.
+        assert contradicts("codex_responses", "zai", self.CODING_BASE) is True
+        # Only codex_responses is gated; every other persisted override stays.
+        assert contradicts("chat_completions", "zai", self.CODING_BASE) is False
+        assert contradicts("anthropic_messages", "kimi-coding", "https://api.kimi.com/coding") is False
+        assert contradicts("chat_completions", "minimax", "https://api.minimax.io/anthropic") is False
+        # Unknown providers keep legacy behavior (persisted mode honored).
+        assert contradicts("codex_responses", "not-a-registry-provider", "https://relay.example/v1") is False
+        # Hosts that mandate the Responses API keep it even for
+        # openai_chat-declared providers.
+        assert contradicts("codex_responses", "zai", "https://api.openai.com/v1") is False
+
+    def test_named_custom_provider_responses_opt_in_unchanged(self, monkeypatch):
+        """A custom_providers entry that explicitly declares codex_responses
+        keeps it — the fix must not globally disable Responses."""
+        monkeypatch.setattr(
+            rp,
+            "load_config",
+            lambda: {
+                "custom_providers": [
+                    {
+                        "name": "resp-relay",
+                        "base_url": "https://relay.example.com/v1",
+                        "api_mode": "codex_responses",
+                        "api_key": "relay-key",
+                    }
+                ]
+            },
+        )
+        monkeypatch.setattr(
+            rp, "get_compatible_custom_providers", lambda config: config["custom_providers"]
+        )
+
+        resolved = rp.resolve_runtime_provider(requested="custom:resp-relay")
+
+        assert resolved["provider"] == "custom"
+        assert resolved["api_mode"] == "codex_responses"
+        assert resolved["base_url"] == "https://relay.example.com/v1"
+
+    def test_xai_responses_path_unchanged(self, monkeypatch):
+        class _NoCredPool:
+            def has_credentials(self):
+                return False
+
+        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "xai")
+        monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "xai"})
+        monkeypatch.setattr(
+            rp,
+            "resolve_api_key_provider_credentials",
+            lambda provider: {"api_key": "xai-key", "base_url": "", "source": "env"},
+        )
+        monkeypatch.setattr(rp, "load_pool", lambda provider: _NoCredPool())
+
+        resolved = rp.resolve_runtime_provider(requested="xai")
+
+        assert resolved["api_mode"] == "codex_responses"

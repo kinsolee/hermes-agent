@@ -146,6 +146,35 @@ def _provider_supports_explicit_api_mode(provider: Optional[str], configured_pro
     return normalized_configured == normalized_provider
 
 
+def _persisted_api_mode_contradicts_provider(configured_mode: Optional[str], provider: Optional[str], base_url: Optional[str]) -> bool:
+    """Report whether a persisted api_mode is stale endpoint-era state.
+
+    ``_provider_supports_explicit_api_mode`` only compares provider NAMES, so a
+    ``codex_responses`` persisted for a different default (e.g. openai-codex)
+    re-activates the moment ``model.provider`` is switched to a provider whose
+    name then matches. A registry provider declared ``openai_chat`` — zai/GLM
+    being the incident — has no ``/responses`` surface at all, so every request
+    404s (``path=/v4/responses``; KSL-121). Only that combination is stale:
+    chat-completions/anthropic persisted overrides (MiniMax, Kimi /coding) stay
+    legal, unknown providers keep legacy behavior, and hosts that mandate the
+    Responses API keep it even for openai_chat-declared providers.
+    """
+    if configured_mode != "codex_responses":
+        return False
+    try:
+        from hermes_cli.providers import TRANSPORT_TO_API_MODE, get_provider
+
+        normalized = (provider or "").strip().lower()
+        pdef = get_provider(normalized)
+        if pdef is None:
+            return False
+        if TRANSPORT_TO_API_MODE.get(pdef.transport) != "chat_completions":
+            return False
+        return _detect_api_mode_for_url((base_url or "").strip()) != "codex_responses"
+    except Exception:
+        return False
+
+
 def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
     configured_provider = str(model_cfg.get("provider") or "").strip().lower()
     configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
@@ -260,7 +289,13 @@ def _resolve_runtime_from_pool_entry(
             if cfg_base_url:
                 base_url = cfg_base_url
         configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-        if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+        # Same contract as the api-key branch: the persisted mode must belong
+        # to this provider family AND not be stale for its declared wire.
+        if (
+            configured_mode
+            and _provider_supports_explicit_api_mode(provider, configured_provider)
+            and not _persisted_api_mode_contradicts_provider(configured_mode, provider, base_url)
+        ):
             api_mode = configured_mode
         elif provider in ("opencode-zen", "opencode-go"):
             from hermes_cli.models import opencode_model_api_mode
@@ -1210,9 +1245,15 @@ def resolve_runtime_provider(
             api_mode = "codex_responses"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
-            # Only honor persisted api_mode when it belongs to the same provider family.
+            # Only honor persisted api_mode when it belongs to the same provider
+            # family AND is not stale for the provider's declared wire (a stale
+            # codex_responses on zai/GLM 404s every request — KSL-121).
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+            if (
+                configured_mode
+                and _provider_supports_explicit_api_mode(provider, configured_provider)
+                and not _persisted_api_mode_contradicts_provider(configured_mode, provider, base_url)
+            ):
                 api_mode = configured_mode
             elif provider in ("opencode-zen", "opencode-go"):
                 from hermes_cli.models import opencode_model_api_mode
